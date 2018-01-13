@@ -7,6 +7,8 @@ LDLIBS = -lstdc++
 IIOLIBS = -lz -ltiff -lpng -ljpeg -lm
 GEOLIBS = -lgeotiff -ltiff
 FFTLIBS = -lfftw3f -lfftw3
+GDAL_LIBS=`gdal-config --libs`
+GDAL_CFLAGS=`gdal-config --cflags`
 
 # The following conditional statement appends "-std=gnu99" to CFLAGS when the
 # compiler does not define __STDC_VERSION__.  The idea is that many older
@@ -22,22 +24,21 @@ SRCDIR = c
 BINDIR = bin
 
 # default rule builds only the programs necessary for the test
-default: $(BINDIR) homography sift imscript mgm piio
+default: $(BINDIR) homography sift imscript mgm piio tvl1
 
-# the "all" rule builds three further correlators
-all: default msmw3 sgbm tvl1
+# the "all" rule builds four further correlators
+all: default msmw3 sgbm mgm_multi
 
 # test for the default configuration
 test: default
-	python -u s2p_test.py
-
+	python -u s2p_test.py --all
 
 # make sure that the destination directory is built
 $(BINDIR):
 	mkdir -p $(BINDIR)
 
 #
-# three standard "modules": homography, sift, and mgm
+# four standard "modules": homography, sift, mgm, and mgm_multi
 #
 
 homography: $(BINDIR)
@@ -52,6 +53,11 @@ sift: $(BINDIR)
 mgm:
 	$(MAKE) -C 3rdparty/mgm
 	cp 3rdparty/mgm/mgm $(BINDIR)
+
+mgm_multi:
+	mkdir -p $(BINDIR)/build_mgm_multi
+	cd $(BINDIR)/build_mgm_multi; cmake ../../3rdparty/mgm_multi; $(MAKE)
+	cp $(BINDIR)/build_mgm_multi/mgm_multi $(BINDIR)
 
 # piio: a required python extension
 piio: s2plib/piio/libiio.so
@@ -98,9 +104,9 @@ msmw3:
 	cp $(BINDIR)/build_msmw3/msmw $(BINDIR)
 
 tvl1:
-	$(MAKE) -C 3rdparty/tvl1flow_3
-	cp 3rdparty/tvl1flow_3/tvl1flow $(BINDIR)
-	cp 3rdparty/tvl1flow_3/callTVL1.sh $(BINDIR)
+	$(MAKE) -C 3rdparty/tvl1flow
+	cp 3rdparty/tvl1flow/tvl1flow $(BINDIR)
+	cp 3rdparty/tvl1flow/callTVL1.sh $(BINDIR)
 
 
 
@@ -112,9 +118,9 @@ PROGRAMS = $(addprefix $(BINDIR)/,$(SRC))
 SRC = $(SRCIIO) $(SRCFFT) $(SRCKKK)
 SRCIIO = downsa backflow synflow imprintf iion qauto qeasy crop bdint morsi\
 	morphoop cldmask disp_to_h_projective colormesh_projective\
-	remove_small_cc plambda
+	remove_small_cc plambda homwarp
 SRCFFT = gblur blur fftconvolve zoom_zeropadding zoom_2d
-SRCKKK = watermask disp_to_h colormesh disp2ply bin2asc siftu ransac srtm4\
+SRCKKK = watermask disp_to_h colormesh disp2ply multidisp2ply  bin2asc siftu ransac srtm4\
 	srtm4_which_tile plyflatten plyextrema plytodsm
 
 imscript: $(BINDIR) $(PROGRAMS)
@@ -157,6 +163,15 @@ $(BINDIR)/disp_to_h: $(SRCDIR)/iio.o $(SRCDIR)/rpc.o c/disp_to_h.c c/vvector.h c
 $(BINDIR)/colormesh: $(SRCDIR)/iio.o $(SRCDIR)/rpc.o $(SRCDIR)/geographiclib_wrapper.o c/colormesh.c c/fail.c c/rpc.h c/read_matrix.c c/smapa.h
 	$(CC) $(CFLAGS) c/iio.o $(SRCDIR)/rpc.o $(SRCDIR)/geographiclib_wrapper.o c/colormesh.c $(IIOLIBS) $(LDLIBS) -lGeographic -o $@
 
+$(SRCDIR)/triangulation.o: c/triangulation.c c/triangulation.h
+	$(CC) $(CFLAGS) -c $< -lm -o $@
+
+$(SRCDIR)/coordconvert.o: c/coordconvert.c c/coordconvert.h
+	$(CC) $(CFLAGS) -c $< -lm -o $@
+
+$(BINDIR)/multidisp2ply: 3rdparty/iio/iio.o $(SRCDIR)/rpc.o $(SRCDIR)/geographiclib_wrapper.o $(SRCDIR)/triangulation.o $(SRCDIR)/coordconvert.o c/multidisp2ply.c c/vvector.h 3rdparty/iio/iio.h c/rpc.h c/triangulation.h c/coordconvert.h c/read_matrix.c
+	$(CC) $(CFLAGS) 3rdparty/iio/iio.o $(SRCDIR)/rpc.o $(SRCDIR)/geographiclib_wrapper.o $(SRCDIR)/triangulation.o $(SRCDIR)/coordconvert.o c/multidisp2ply.c $(IIOLIBS) -lGeographic -o $@
+
 $(BINDIR)/disp2ply: $(SRCDIR)/iio.o $(SRCDIR)/rpc.o $(SRCDIR)/geographiclib_wrapper.o c/disp2ply.c c/fail.c c/rpc.h c/read_matrix.c c/smapa.h
 	$(CC) $(CFLAGS) c/iio.o $(SRCDIR)/rpc.o $(SRCDIR)/geographiclib_wrapper.o c/disp2ply.c $(IIOLIBS) $(LDLIBS) -lGeographic -o $@
 
@@ -164,7 +179,7 @@ $(BINDIR)/plyextrema: $(SRCDIR)/plyextrema.c $(SRCDIR)/iio.o
 	$(CC) $(CFLAGS)  $^ -o $@ $(IIOLIBS)
 
 $(BINDIR)/plyflatten: $(SRCDIR)/plyflatten.c $(SRCDIR)/iio.o
-	$(CC) $(CFLAGS) -I/usr/include/geotiff $^ -o $@ $(IIOLIBS) $(GEOLIBS)
+	$(CC) $(CFLAGS) $(GDAL_CFLAGS) $^ -o $@ $(IIOLIBS) $(GDAL_LIBS)
 
 $(BINDIR)/plytodsm: $(SRCDIR)/plytodsm.c $(SRCDIR)/iio.o
 	$(CC) $(CFLAGS) -I/usr/include/geotiff $^ -o $@ $(IIOLIBS) $(GEOLIBS)
@@ -176,10 +191,21 @@ $(SRCDIR)/geographiclib_wrapper.o: c/geographiclib_wrapper.cpp
 $(SRCDIR)/geoid_height_wrapper.o: c/geoid_height_wrapper.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@ -DGEOID_DATA_FILE_PATH="\"$(CURDIR)/c\""
 
+# automatic dependency generation
+-include makefile.dep
+ALL_SOURCES=`ls c/*.c c/*.cc c/*.cpp`
+.PHONY:
+depend:
+	$(CC) -MM $(ALL_SOURCES) | sed '/^[^ ]/s/^/c\//' > makefile.dep
+
 
 # rules for cleaning, nothing interesting below this point
 clean: clean_homography clean_asift clean_sift clean_imscript clean_msmw\
-	clean_msmw2 clean_msmw3 clean_tvl1 clean_sgbm clean_mgm clean_piio
+	clean_msmw2 clean_msmw3 clean_tvl1 clean_sgbm clean_mgm clean_piio\
+	clean_depend
+
+clean_depend:
+	$(RM) makefile.dep
 
 clean_homography:
 	$(MAKE) -C c/homography clean
@@ -198,6 +224,8 @@ clean_imscript:
 	$(RM) $(PROGRAMS)
 	$(RM) $(SRCDIR)/iio.o
 	$(RM) $(SRCDIR)/rpc.o
+	$(RM) $(SRCDIR)/geographiclib_wrapper.o
+	$(RM) $(SRCDIR)/geoid_height_wrapper.o
 
 clean_msmw:
 	$(RM) -r $(BINDIR)/build_msmw
@@ -212,7 +240,7 @@ clean_msmw3:
 	$(RM) $(BINDIR)/msmw
 
 clean_tvl1:
-	$(MAKE) -C 3rdparty/tvl1flow_3 clean
+	$(MAKE) -C 3rdparty/tvl1flow clean
 	$(RM) $(BINDIR)/tvl1flow
 	$(RM) $(BINDIR)/callTVL1.sh
 

@@ -52,8 +52,12 @@ cfg['skip_existing'] = False
 # resolution of the output digital surface model, in meters per pixel
 cfg['dsm_resolution'] = 4
 
-# zoom out applied to input images
-cfg['subsampling_factor'] = 1
+# radius to compute altitudes (and to interpolate the small holes)
+cfg['dsm_radius'] = 0
+
+# dsm_sigma controls the spread of the blob from each point for the dsm computation
+# (dsm_resolution by default)
+cfg['dsm_sigma'] = None
 
 # sift threshold on the first over second best match ratio
 cfg['sift_match_thresh'] = 0.6
@@ -70,6 +74,12 @@ cfg['n_gcp_per_axis'] = 5
 # max distance allowed for a point to the epipolar line of its match
 cfg['epipolar_thresh'] = 0.5
 
+# triangulation mode : 'pairwise'or 'geometric'
+cfg['triangulation_mode'] = 'pairwise'
+
+# use global pointing for geometric triangulation
+cfg['use_global_pointing_for_geometric_triangulation'] = False
+
 # stereo matching algorithm: 'tvl1', 'msmw', 'hirschmuller08',
 # hirschmuller08_laplacian', 'sgbm', 'mgm'
 cfg['matching_algorithm'] = 'mgm'
@@ -77,9 +87,14 @@ cfg['matching_algorithm'] = 'mgm'
 # size of the Census NCC square windows used in mgm
 cfg['census_ncc_win'] = 5
 
-# set these params if you want to impose the disparity range manually
+# set these params if you want to impose the disparity range manually (cfg['disp_range_method'] == 'fixed_pixel_range')
 cfg['disp_min'] = None
 cfg['disp_max'] = None
+
+# set these params if you want to impose the altitude range manually (cfg['disp_range_method'] == 'fixed_altitude_range')
+cfg['alt_min'] = None
+cfg['alt_max'] = None
+
 
 # radius for erosion of valid disparity areas. Ignored if less than 2
 cfg['msk_erosion'] = 2
@@ -93,7 +108,7 @@ cfg['fusion_thresh'] = 3
 cfg['disable_srtm'] = False
 cfg['rpc_alt_range_scale_factor'] = 1
 
-# method to compute the disparity range: "sift", "srtm" or "wider_sift_srtm"
+# method to compute the disparity range: "sift", "srtm", "wider_sift_srtm", "fixed_pixel_range", "fixed_altitude_range"
 cfg['disp_range_method'] = "wider_sift_srtm"
 cfg['disp_range_srtm_low_margin'] = -10
 cfg['disp_range_srtm_high_margin'] = +100
@@ -116,3 +131,6 @@ cfg['ll_bbx'] = ("-inf", "inf", "-inf", "inf")
 
 # use srtm to generate a watermask
 cfg['use_srtm_for_water'] = False
+
+# If true, lidar preprocessor will be called if found in path
+cfg['run_lidar_preprocessor'] = False

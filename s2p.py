@@ -22,11 +22,15 @@
 from __future__ import print_function
 import sys
 import os.path
+import json
 import datetime
 import argparse
 import numpy as np
+import subprocess
 import multiprocessing
 from osgeo import gdal
+import collections
+import shutil
 
 gdal.UseExceptions()
 
@@ -65,7 +69,14 @@ def pointing_correction(tile, i):
 
     # correct pointing error
     print('correcting pointing on tile {} {} pair {}...'.format(x, y, i))
-    A, m = pointing_accuracy.compute_correction(img1, rpc1, img2, rpc2, x, y, w, h)
+    try:
+        A, m = pointing_accuracy.compute_correction(img1, rpc1, img2, rpc2, x, y, w, h)
+    except common.RunFailure as e:
+        stderr = os.path.join(out_dir, 'stderr.log')
+        with open(stderr, 'w') as f:
+            f.write('ERROR during pointing correction with cmd: %s\n' % e[0]['command'])
+            f.write('Stop processing this pair\n')
+        return
 
     if A is not None:  # A is the correction matrix
         np.savetxt(os.path.join(out_dir, 'pointing.txt'), A, fmt='%6.3f')
@@ -115,6 +126,12 @@ def rectification_pair(tile, i):
                             'global_pointing_pair_{}.txt'.format(i))
 
     outputs = ['disp_min_max.txt', 'rectified_ref.tif', 'rectified_sec.tif']
+
+    if os.path.exists(os.path.join(out_dir, 'stderr.log')):
+        print('rectification: stderr.log exists')
+        print('pair_{} not processed on tile {} {}'.format(i, x, y))
+        return
+
     if cfg['skip_existing'] and all(os.path.isfile(os.path.join(out_dir, f)) for
                                     f in outputs):
         print('rectification done on tile {} {} pair {}'.format(x, y, i))
@@ -129,6 +146,27 @@ def rectification_pair(tile, i):
         m = np.loadtxt(os.path.join(out_dir, 'sift_matches.txt'))
     except IOError:
         m = None
+
+    x, y, w, h = tile['coordinates']
+
+    cur_dir = os.path.join(tile['dir'],'pair_{}'.format(i))
+    for n in tile['neighborhood_dirs']:
+        nei_dir = os.path.join(tile['dir'], n, 'pair_{}'.format(i))
+        if os.path.exists(nei_dir) and not os.path.samefile(cur_dir, nei_dir):
+            sift_from_neighborhood = os.path.join(nei_dir, 'sift_matches.txt')
+            try:
+                m_n = np.loadtxt(sift_from_neighborhood)
+                # added sifts in the ellipse of semi axes : (3*w/4, 3*h/4)
+                m_n = m_n[np.where(np.linalg.norm([(m_n[:,0]-(x+w/2))/w,
+                                                   (m_n[:,1]-(y+h/2))/h],
+                                                  axis=0) < 3.0/4)]
+                if m is None:
+                    m = m_n
+                else:
+                    m = np.concatenate((m, m_n))
+            except IOError:
+                print('%s does not exist' % sift_from_neighborhood)
+
     rect1 = os.path.join(out_dir, 'rectified_ref.tif')
     rect2 = os.path.join(out_dir, 'rectified_sec.tif')
     H1, H2, disp_min, disp_max = rectification.rectify_pair(img1, img2, rpc1,
@@ -158,6 +196,12 @@ def stereo_matching(tile,i):
     x, y = tile['coordinates'][:2]
 
     outputs = ['rectified_mask.png', 'rectified_disp.tif']
+
+    if os.path.exists(os.path.join(out_dir, 'stderr.log')):
+        print('disparity estimation: stderr.log exists')
+        print('pair_{} not processed on tile {} {}'.format(i, x, y))
+        return
+
     if cfg['skip_existing'] and all(os.path.isfile(os.path.join(out_dir, f)) for
                                     f in outputs):
         print('disparity estimation done on tile {} {} pair {}'.format(x, y, i))
@@ -169,8 +213,7 @@ def stereo_matching(tile,i):
     disp = os.path.join(out_dir, 'rectified_disp.tif')
     mask = os.path.join(out_dir, 'rectified_mask.png')
     disp_min, disp_max = np.loadtxt(os.path.join(out_dir, 'disp_min_max.txt'))
-    if cfg['disp_min'] is not None: disp_min = cfg['disp_min']
-    if cfg['disp_max'] is not None: disp_max = cfg['disp_max']
+
     block_matching.compute_disparity_map(rect1, rect2, disp, mask,
                                          cfg['matching_algorithm'], disp_min,
                                          disp_max)
@@ -197,6 +240,11 @@ def disparity_to_height(tile, i):
     height_map = os.path.join(out_dir, 'height_map.tif')
     x, y, w, h = tile['coordinates']
 
+    if os.path.exists(os.path.join(out_dir, 'stderr.log')):
+        print('triangulation: stderr.log exists')
+        print('pair_{} not processed on tile {} {}'.format(i, x, y))
+        return
+
     if cfg['skip_existing'] and os.path.isfile(height_map):
         print('triangulation done on tile {} {} pair {}'.format(x, y, i))
         return
@@ -212,7 +260,7 @@ def disparity_to_height(tile, i):
     out_mask = os.path.join(tile['dir'], 'cloud_water_image_domain_mask.png')
     pointing = os.path.join(cfg['out_dir'],
                             'global_pointing_pair_{}.txt'.format(i))
-    triangulation.height_map(height_map, x, y, w, h, cfg['subsampling_factor'],
+    triangulation.height_map(height_map, x, y, w, h,
                              rpc1, rpc2, H_ref, H_sec, disp, mask, rpc_err,
                              out_mask, pointing)
 
@@ -233,9 +281,15 @@ def disparity_to_ply(tile):
     """
     out_dir = os.path.join(tile['dir'])
     ply_file = os.path.join(out_dir, 'cloud.ply')
+    plyextrema = os.path.join(out_dir, 'plyextrema.txt')
     x, y, w, h = tile['coordinates']
     rpc1 = cfg['images'][0]['rpc']
     rpc2 = cfg['images'][1]['rpc']
+
+    if os.path.exists(os.path.join(out_dir, 'stderr.log')):
+        print('triangulation: stderr.log exists')
+        print('pair_1 not processed on tile {} {}'.format(x, y))
+        return
 
     if cfg['skip_existing'] and os.path.isfile(ply_file):
         print('triangulation done on tile {} {}'.format(x, y))
@@ -272,6 +326,9 @@ def disparity_to_ply(tile):
                                           xybbx=(x, x+w, y, y+h),
                                           xymsk=mask_orig)
 
+    # compute the point cloud extrema (xmin, xmax, xmin, ymax)
+    common.run("plyextrema %s %s" % (ply_file, plyextrema))
+
     if cfg['clean_intermediate']:
         common.remove(H_ref)
         common.remove(H_sec)
@@ -282,13 +339,113 @@ def disparity_to_ply(tile):
         common.remove(os.path.join(out_dir, 'pair_1', 'rectified_ref.tif'))
 
 
+def multidisparities_to_ply(tile):
+    """
+    Compute a point cloud from the disparity maps of N-pairs of image tiles.
+
+    Args:
+        tile: dictionary containing the information needed to process a tile.
+
+    # There is no guarantee that this function works with z!=1
+    """
+    out_dir = os.path.join(tile['dir'])
+    ply_file = os.path.join(out_dir, 'cloud.ply')
+    plyextrema = os.path.join(out_dir, 'plyextrema.txt')
+    x, y, w, h = tile['coordinates']
+
+    rpc_ref = cfg['images'][0]['rpc']
+    disp_list = list()
+    rpc_list = list()
+
+    if cfg['skip_existing'] and os.path.isfile(ply_file):
+        print('triangulation done on tile {} {}'.format(x, y))
+        return
+
+    mask_orig = os.path.join(out_dir, 'cloud_water_image_domain_mask.png')
+
+    print('triangulating tile {} {}...'.format(x, y))
+    n = len(cfg['images']) - 1
+    for i in range(n):
+        pair = 'pair_%d' % (i+1)
+        H_ref = os.path.join(out_dir, pair, 'H_ref.txt')
+        H_sec = os.path.join(out_dir, pair, 'H_sec.txt')
+        disp = os.path.join(out_dir, pair, 'rectified_disp.tif')
+        mask_rect = os.path.join(out_dir, pair, 'rectified_mask.png')
+        disp2D = os.path.join(out_dir, pair, 'disp2D.tif')
+        rpc_sec = cfg['images'][i+1]['rpc']
+
+        if os.path.exists(disp):
+            # homography for warp
+            T = common.matrix_translation(x, y)
+            hom_ref = np.loadtxt(H_ref)
+            hom_ref_shift = np.dot(hom_ref, T)
+
+            # homography for 1D to 2D conversion
+            hom_sec = np.loadtxt(H_sec)
+            if cfg["use_global_pointing_for_geometric_triangulation"] is True:
+                pointing = os.path.join(cfg['out_dir'], 'global_pointing_%s.txt' % pair)
+                hom_pointing = np.loadtxt(pointing)
+                hom_sec = np.dot(hom_sec,np.linalg.inv(hom_pointing))
+            hom_sec_shift_inv = np.linalg.inv(hom_sec)
+
+            h1 = " ".join(str(x) for x in hom_ref_shift.flatten())
+            h2 = " ".join(str(x) for x in hom_sec_shift_inv.flatten())
+
+            # relative disparity map to absolute disparity map
+            tmp_abs = common.tmpfile('.tif')
+            os.environ["PLAMBDA_GETPIXEL"] = "0"
+            common.run('plambda %s %s "y 0 = nan x[0] :i + x[1] :j + 1 3 njoin if" -o %s' % (disp, mask_rect, tmp_abs))
+
+            # 1d to 2d conversion
+            tmp_1d_to_2d = common.tmpfile('.tif')
+            common.run('plambda %s "%s 9 njoin x mprod" -o %s' % (tmp_abs, h2, tmp_1d_to_2d))
+
+            # warp
+            tmp_warp = common.tmpfile('.tif')
+            common.run('homwarp -o 2 "%s" %d %d %s %s' % (h1, w, h, tmp_1d_to_2d, tmp_warp))
+
+            # set masked value to NaN
+            exp = 'y 0 = nan x if'
+            common.run('plambda %s %s "%s" -o %s' % (tmp_warp, mask_orig, exp, disp2D))
+            # disp2D contains positions in the secondary image
+
+            # added input data for triangulation module
+            disp_list.append(disp2D)
+            rpc_list.append(rpc_sec)
+
+            if cfg['clean_intermediate']:
+                common.remove(H_ref)
+                common.remove(H_sec)
+                common.remove(disp)
+                common.remove(mask_rect)
+                common.remove(mask_orig)
+
+    colors = os.path.join(out_dir, 'ref.png')
+    if cfg['images'][0]['clr']:
+        common.image_crop_gdal(cfg['images'][0]['clr'], x, y, w, h, colors)
+    else:
+        common.image_qauto(common.image_crop_gdal(cfg['images'][0]['img'], x, y,
+                                                 w, h), colors)
+
+    # compute the point cloud
+    triangulation.multidisp_map_to_point_cloud(ply_file, disp_list, rpc_ref, rpc_list,
+                                               colors,
+                                               utm_zone=cfg['utm_zone'],
+                                               llbbx=tuple(cfg['ll_bbx']),
+                                               xybbx=(x, x+w, y, y+h))
+
+    # compute the point cloud extrema (xmin, xmax, xmin, ymax)
+    common.run("plyextrema %s %s" % (ply_file, plyextrema))
+
+    if cfg['clean_intermediate']:
+        common.remove(colors)
+
 def mean_heights(tile):
     """
     """
     w, h = tile['coordinates'][2:]
-    z = cfg['subsampling_factor']
     n = len(cfg['images']) - 1
-    maps = np.empty((int(h/z), int(w/z), n))
+    maps = np.empty((h, w, n))
     for i in range(n):
         try:
             f = gdal.Open(os.path.join(tile['dir'], 'pair_{}'.format(i + 1),
@@ -300,31 +457,50 @@ def mean_heights(tile):
 
     validity_mask = maps.sum(axis=2)  # sum to propagate nan values
     validity_mask += 1 - validity_mask  # 1 on valid pixels, and nan on invalid
-    return [np.nanmean(validity_mask * maps[:, :, i]) for i in range(n)]
+
+    # save the n mean height values to a txt file in the tile directory
+    np.savetxt(os.path.join(tile['dir'], 'local_mean_heights.txt'),
+               [np.nanmean(validity_mask * maps[:, :, i]) for i in range(n)])
 
 
-def heights_fusion(tile, mean_heights_global):
+def global_mean_heights(tiles):
+    """
+    """
+    local_mean_heights = [np.loadtxt(os.path.join(t['dir'], 'local_mean_heights.txt'))
+                          for t in tiles]
+    global_mean_heights = np.nanmean(local_mean_heights, axis=0)
+    for i in range(len(cfg['images']) - 1):
+        np.savetxt(os.path.join(cfg['out_dir'],
+                                'global_mean_height_pair_{}.txt'.format(i+1)),
+                   [global_mean_heights[i]])
+
+
+def heights_fusion(tile):
     """
     Merge the height maps computed for each image pair and generate a ply cloud.
 
     Args:
         tile: a dictionary that provides all you need to process a tile
-        mean_heights_global: list containing the means of all the global height
-            maps
     """
     tile_dir = tile['dir']
-    nb_pairs = len(mean_heights_global)
     height_maps = [os.path.join(tile_dir, 'pair_%d' % (i + 1), 'height_map.tif')
-                   for i in range(nb_pairs)]
+                   for i in range(len(cfg['images']) - 1)]
 
     # remove spurious matches
     if cfg['cargarse_basura']:
         for img in height_maps:
             common.cargarse_basura(img, img)
 
+    # load global mean heights
+    global_mean_heights = []
+    for i in range(len(cfg['images']) - 1):
+        x = np.loadtxt(os.path.join(cfg['out_dir'],
+                                    'global_mean_height_pair_{}.txt'.format(i+1)))
+        global_mean_heights.append(x)
+
     # merge the height maps (applying mean offset to register)
     fusion.merge_n(os.path.join(tile_dir, 'height_map.tif'), height_maps,
-                   mean_heights_global, averaging=cfg['fusion_operator'],
+                   global_mean_heights, averaging=cfg['fusion_operator'],
                    threshold=cfg['fusion_thresh'])
 
     if cfg['clean_intermediate']:
@@ -339,10 +515,14 @@ def heights_to_ply(tile):
     Args:
         tile: a dictionary that provides all you need to process a tile
     """
+    # merge the n-1 height maps of the tile (n = nb of images)
+    heights_fusion(tile)
+
+    # compute a ply from the merged height map
     out_dir = tile['dir']
     x, y, w, h = tile['coordinates']
-    z = cfg['subsampling_factor']
     plyfile = os.path.join(out_dir, 'cloud.ply')
+    plyextrema = os.path.join(out_dir, 'plyextrema.txt')
     height_map = os.path.join(out_dir, 'height_map.tif')
     if cfg['skip_existing'] and os.path.isfile(plyfile):
         print('ply file already exists for tile {} {}'.format(x, y))
@@ -350,18 +530,21 @@ def heights_to_ply(tile):
 
     # H is the homography transforming the coordinates system of the original
     # full size image into the coordinates system of the crop
-    H = np.dot(np.diag([1 / z, 1 / z, 1]), common.matrix_translation(-x, -y))
+    H = np.dot(np.diag([1, 1, 1]), common.matrix_translation(-x, -y))
     colors = os.path.join(out_dir, 'ref.png')
     if cfg['images'][0]['clr']:
         common.image_crop_gdal(cfg['images'][0]['clr'], x, y, w, h, colors)
     else:
         common.image_qauto(common.image_crop_gdal(cfg['images'][0]['img'], x, y,
                                                  w, h), colors)
-    common.image_safe_zoom_fft(colors, z, colors)
+        
     triangulation.height_map_to_point_cloud(plyfile, height_map,
                                             cfg['images'][0]['rpc'], H, colors,
                                             utm_zone=cfg['utm_zone'],
                                             llbbx=tuple(cfg['ll_bbx']))
+
+    # compute the point cloud extrema (xmin, xmax, xmin, ymax)
+    common.run("plyextrema %s %s" % (plyfile, plyextrema))
 
     if cfg['clean_intermediate']:
         common.remove(height_map)
@@ -369,26 +552,89 @@ def heights_to_ply(tile):
         common.remove(os.path.join(out_dir,
                                    'cloud_water_image_domain_mask.png'))
 
+def plys_to_dsm(tile):
+    """
+    """
+    out_dsm = os.path.join(tile['dir'], 'dsm.tif')
 
-def plys_to_dsm(tiles):
-    """
-    """
-    out_dsm = os.path.join(cfg['out_dir'], 'dsm.tif')
-    clouds = ' '.join(os.path.join(t['dir'], 'cloud.ply') for t in tiles)
+    res = cfg['dsm_resolution']
     if 'utm_bbx' in cfg:
         bbx = cfg['utm_bbx']
-        common.run("ls %s | plyflatten -bb \"%f %f %f %f \" %f %s" % (clouds,
-                                                                      bbx[0],
-                                                                      bbx[1],
-                                                                      bbx[2],
-                                                                      bbx[3],
-                                                                      cfg['dsm_resolution'],
-                                                                      out_dsm))
+        global_xoff = bbx[0]
+        global_yoff = bbx[3]
     else:
-        common.run("ls %s | plyflatten %f %s" % (clouds, cfg['dsm_resolution'],
-                                                 out_dsm))
-        # ls files | ./bin/plyflatten [-c column] [-bb "xmin xmax ymin ymax"] resolution out.tif
+        global_xoff = 0 # arbitrary reference
+        global_yoff = 0 # arbitrary reference
 
+    res = cfg['dsm_resolution']
+
+    xmin, xmax, ymin, ymax = np.loadtxt(os.path.join(tile['dir'], "plyextrema.txt"))
+
+    # compute xoff, yoff, xsize, ysize considering final dsm
+    local_xoff = global_xoff + np.floor((xmin - global_xoff) / res) * res
+    local_xsize = int(1 + np.floor((xmax - local_xoff) / res))
+
+    local_yoff = global_yoff + np.ceil((ymax - global_yoff) / res) * res
+    local_ysize = int(1 - np.floor((ymin - local_yoff) / res))
+
+    clouds = '\n'.join(os.path.join(tile['dir'],n_dir, 'cloud.ply') for n_dir in tile['neighborhood_dirs'])
+
+    cmd = ['plyflatten', str(cfg['dsm_resolution']), out_dsm]
+    cmd += ['-srcwin', '{} {} {} {}'.format(local_xoff, local_yoff,
+                                            local_xsize, local_ysize)]
+
+    cmd += ['-radius', str(cfg['dsm_radius'])]
+
+    if cfg['dsm_sigma'] is not None:
+        cmd += ['-sigma', str(cfg['dsm_sigma'])]
+
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    q = p.communicate(input=clouds.encode())
+
+    run_cmd = "ls %s | %s" % (clouds.replace('\n', ' '), " ".join(cmd))
+    print ("\nRUN: %s" % run_cmd)
+
+    if p.returncode != 0:
+        raise common.RunFailure({"command": run_cmd, "environment": os.environ,
+                                 "output": q})
+
+    # ls files | ./bin/plyflatten [-c column] [-srcwin "xoff yoff xsize ysize"] resolution out.tif
+
+
+def global_dsm(tiles):
+    """
+    """
+    out_dsm_vrt = os.path.join(cfg['out_dir'], 'dsm.vrt')
+    out_dsm_tif = os.path.join(cfg['out_dir'], 'dsm.tif')
+
+    dsms_list = [os.path.join(t['dir'], 'dsm.tif') for t in tiles]
+    dsms = '\n'.join(d for d in dsms_list if os.path.exists(d))
+
+    input_file_list = os.path.join(cfg['out_dir'], 'gdalbuildvrt_input_file_list.txt')
+
+    with open(input_file_list, 'w') as f:
+        f.write(dsms)
+
+    common.run("gdalbuildvrt -vrtnodata nan -input_file_list %s %s" % (input_file_list,
+                                                                       out_dsm_vrt))
+
+    res = cfg['dsm_resolution']
+
+    if 'utm_bbx' in cfg:
+        bbx = cfg['utm_bbx']
+        xoff = bbx[0]
+        yoff = bbx[3]
+        xsize = int(np.ceil((bbx[1]-bbx[0]) / res))
+        ysize = int(np.ceil((bbx[3]-bbx[2]) / res))
+        projwin = "-projwin %s %s %s %s" % (xoff, yoff,
+                                            xoff + xsize * res,
+                                            yoff - ysize * res)
+    else:
+        projwin = ""
+
+    common.run(" ".join(["gdal_translate",
+                         "-co TILED=YES -co BIGTIFF=IF_SAFER",
+                         "%s %s %s" % (projwin, out_dsm_vrt, out_dsm_tif)]))
 
 def lidar_preprocessor(tiles):
     """
@@ -404,22 +650,34 @@ def lidar_preprocessor(tiles):
                                            'cloud.lidar_viewer'), plys)
 
 
-ALL_STEPS = ['initialisation', 'local-pointing', 'global-pointing',
-             'rectification', 'matching', 'triangulation', 'dsm-rasterization',
-             'lidar-preprocessor']
+# ALL_STEPS is a ordonned dictionary : key = 'stepname' : value = is_distributed (True/False)
+# initialization : pass in a sequence of tuples
+ALL_STEPS = [('initialisation', False),
+             ('local-pointing', True),
+             ('global-pointing', False),
+             ('rectification', True),
+             ('matching', True),
+             ('triangulation', True),
+             ('disparity-to-height', True),
+             ('global-mean-heights', False),
+             ('heights-to-ply', True),
+             ('local-dsm-rasterization', True),
+             ('global-dsm-rasterization', False),
+             ('lidar-preprocessor', False)]
+ALL_STEPS = collections.OrderedDict(ALL_STEPS)
 
 
-def main(config_file, steps=ALL_STEPS):
+def main(user_cfg, steps=ALL_STEPS):
     """
     Launch the s2p pipeline with the parameters given in a json file.
 
     Args:
-        config_file: path to a json configuration file
+        user_cfg: user config dictionary
         steps: either a string (single step) or a list of strings (several
             steps)
     """
     common.print_elapsed_time.t0 = datetime.datetime.now()
-    initialization.build_cfg(config_file)
+    initialization.build_cfg(user_cfg)
     if 'initialisation' in steps:
         initialization.make_dirs()
 
@@ -430,12 +688,13 @@ def main(config_file, steps=ALL_STEPS):
     cfg['max_processes'] = nb_workers
 
     tw, th = initialization.adjust_tile_size()
-    print('\ndiscarding masked tiles...')
-    tiles = initialization.tiles_full_info(tw, th)
+    tiles_txt = os.path.join(cfg['out_dir'],'tiles.txt')
+    create_masks = 'initialisation' in steps
+    tiles = initialization.tiles_full_info(tw, th, tiles_txt, create_masks)
 
     if 'initialisation' in steps:
         # Write the list of json files to outdir/tiles.txt
-        with open(os.path.join(cfg['out_dir'],'tiles.txt'),'w') as f:
+        with open(tiles_txt,'w') as f:
             for t in tiles:
                 f.write(t['json']+os.linesep)
 
@@ -462,42 +721,98 @@ def main(config_file, steps=ALL_STEPS):
         print('running stereo matching...')
         parallel.launch_calls(stereo_matching, tiles_pairs, nb_workers)
 
-    if 'triangulation' in steps:
-        if n > 2:
+    if n > 2 and cfg['triangulation_mode'] == 'pairwise':
+        if 'disparity-to-height' in steps:
             print('computing height maps...')
             parallel.launch_calls(disparity_to_height, tiles_pairs, nb_workers)
 
-            print('registering height maps...')
-            mean_heights_local = parallel.launch_calls(mean_heights, tiles,
-                                                       nb_workers)
+            print('computing local pairwise height offsets...')
+            parallel.launch_calls(mean_heights, tiles, nb_workers)
 
+        if 'global-mean-heights' in steps:
             print('computing global pairwise height offsets...')
-            mean_heights_global = np.nanmean(mean_heights_local, axis=0)
+            global_mean_heights(tiles)
 
-            print('merging height maps...')
-            parallel.launch_calls(heights_fusion, tiles, nb_workers,
-                                  mean_heights_global)
-
-            print('computing point clouds...')
+        if 'heights-to-ply' in steps:
+            print('merging height maps and computing point clouds...')
             parallel.launch_calls(heights_to_ply, tiles, nb_workers)
 
-        else:
+    else:
+        if 'triangulation' in steps:
             print('triangulating tiles...')
-            parallel.launch_calls(disparity_to_ply, tiles, nb_workers)
+            if cfg['triangulation_mode'] == 'geometric':
+                parallel.launch_calls(multidisparities_to_ply, tiles, nb_workers)
+            elif cfg['triangulation_mode'] == 'pairwise':
+                parallel.launch_calls(disparity_to_ply, tiles, nb_workers)
+            else:
+                raise ValueError("possible values for 'triangulation_mode' : 'pairwise' or 'geometric'")
 
-    if 'dsm-rasterization' in steps:
-        print('computing DSM...')
-        plys_to_dsm(tiles)
+    if 'local-dsm-rasterization' in steps:
+        print('computing DSM by tile...')
+        parallel.launch_calls(plys_to_dsm, tiles, nb_workers)
+
+    if 'global-dsm-rasterization' in steps:
+        print('computing global DSM...')
+        global_dsm(tiles)
         common.print_elapsed_time()
 
     if 'lidar-preprocessor' in steps:
-        print('lidar preprocessor...')
-        lidar_preprocessor(tiles)
-        common.print_elapsed_time()
+        if cfg['run_lidar_preprocessor']:
+            print('lidar preprocessor...')
+            lidar_preprocessor(tiles)
+            common.print_elapsed_time()
+        else:
+            print("LidarPreprocessor explicitly disabled in config.json")
 
     # cleanup
     common.garbage_cleanup()
     common.print_elapsed_time(since_first_call=True)
+
+
+def make_path_relative_to_file(path, f):
+    return os.path.join(os.path.abspath(os.path.dirname(f)), path)
+
+
+def read_tiles(tiles_file):
+    tiles = []
+    outdir = os.path.dirname(tiles_file)
+
+    with open(tiles_file) as f:
+        tiles = f.readlines()
+
+    # Strip trailing \n
+    tiles = list(map(str.strip,tiles))
+    tiles = [os.path.join(outdir, t) for t in tiles]
+
+    return tiles
+
+
+def read_config_file(config_file):
+    """
+    Read a json configuration file and interpret relative paths.
+
+    If any input or output path is a relative path, it is interpreted as
+    relative to the config_file location (and not relative to the current
+    working directory). Absolute paths are left unchanged.
+    """
+    with open(config_file, 'r') as f:
+        user_cfg = json.load(f)
+
+    # output paths
+    if not os.path.isabs(user_cfg['out_dir']):
+        print('WARNING: out_dir is a relative path. It is interpreted with '
+              'respect to {} location (not cwd)'.format(config_file))
+        user_cfg['out_dir'] = make_path_relative_to_file(user_cfg['out_dir'],
+                                                         config_file)
+        print('out_dir is: {}'.format(user_cfg['out_dir']))
+
+    # input paths
+    for img in user_cfg['images']:
+        for d in ['img', 'rpc', 'clr', 'cld', 'roi', 'wat']:
+            if d in img and img[d] is not None and not os.path.isabs(img[d]):
+                img[d] = make_path_relative_to_file(img[d], config_file)
+
+    return user_cfg
 
 
 if __name__ == '__main__':
@@ -510,4 +825,11 @@ if __name__ == '__main__':
     parser.add_argument('--step', type=str, choices=ALL_STEPS,
                         default=ALL_STEPS)
     args = parser.parse_args()
-    main(args.config, args.step)
+
+    user_cfg = read_config_file(args.config)
+
+    main(user_cfg, args.step)
+
+    # Backup input file for sanity check
+    if not args.config.startswith(os.path.abspath(cfg['out_dir']+os.sep)):
+        shutil.copy2(args.config,os.path.join(cfg['out_dir'],'config.json.orig'))

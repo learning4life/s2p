@@ -15,6 +15,7 @@ from s2plib import evaluation
 from s2plib import common
 from s2plib import sift
 from s2plib import visualisation
+from s2plib import block_matching
 from s2plib.config import cfg
 
 
@@ -185,18 +186,10 @@ def disparity_range_from_matches(matches, H1, H2, w, h):
     x2 = p2[:, 0]
     y2 = p2[:, 1]
 
-    # estimate an affine transformation (tilt, shear and bias) mapping p1 on p2
-    t, s, b = np.linalg.lstsq(np.vstack((x2, y2, y2*0+1)).T, x1)[0][:3]
-
-    # compute the disparities for the affine model. The extrema are obtained at
-    # the ROI corners
-    xx = np.array([0, w, 0, w])
-    yy = np.array([0, 0, h, h])
-    disp_affine_model = (xx*t + yy*s + b) - xx
 
     # compute the final disparity range
-    disp_min = np.floor(min(np.min(disp_affine_model), np.min(x2 - x1)))
-    disp_max = np.ceil(max(np.max(disp_affine_model), np.max(x2 - x1)))
+    disp_min = np.floor(np.min(x2 - x1))
+    disp_max = np.ceil(np.max(x2 - x1))
 
     # add a security margin to the disparity range
     disp_min *= (1 - np.sign(disp_min) * cfg['disp_range_extra_margin'])
@@ -227,29 +220,65 @@ def disparity_range(rpc1, rpc2, x, y, w, h, H1, H2, matches, A=None):
     Returns:
         disp: 2-uple containing the horizontal disparity range
     """
-    # srtm disparity range
-    if (cfg['disp_range_method'] in ['srtm', 'wider_sift_srtm']) or matches is None or len(matches) < 2:
+    # Default disparity range to return if everything else breaks
+    disp = (-3, 3)
+    srtm_disp = None
+    sift_disp = None
+    alt_disp  = None
+    
+    # Compute SRTM disparity range if needed
+    if cfg['disp_range_method'] in ['srtm', 'wider_sift_srtm']:
         srtm_disp = rpc_utils.srtm_disp_range_estimation(rpc1, rpc2, x, y, w, h,
                                                          H1, H2, A,
                                                          cfg['disp_range_srtm_high_margin'],
                                                          cfg['disp_range_srtm_low_margin'])
         print("SRTM disparity range: [%f, %f]" % (srtm_disp[0], srtm_disp[1]))
+        
+    # Compute SIFT disparity range if needed
+    if cfg['disp_range_method'] in ['sift', 'wider_sift_srtm']:
+        if matches is not None and len(matches) >= 2:
+            sift_disp = disparity_range_from_matches(matches, H1, H2, w, h)
+            print("SIFT disparity range: [%f, %f]" % (sift_disp[0], sift_disp[1]))
+        else:
+            print("No SIFT available, SIFT disparity can not be estimated")
 
-    if cfg['disp_range_method'] == 'srtm' or matches is None or len(matches) < 2:
-        return srtm_disp
+    # Compute altitude range disparity if needed
+    if cfg['disp_range_method'] == 'fixed_altitude_range':
+        if cfg['alt_min'] is not None and cfg['alt_max'] is not None:
+            alt_disp = rpc_utils.altitude_range_to_disp_range(cfg['alt_min'],
+                                                              cfg['alt_max'],
+                                                              rpc1, rpc2,
+                                                              x, y, w, h,
+                                                              H1, H2, A)
+            print("Altitude fixed disparity range: [%f, %f]" % (alt_disp[0], alt_disp[1]))
+            
+    # Now, compute disparity range according to selected method
+    if cfg['disp_range_method'] == 'srtm':
+        disp = srtm_disp
 
-    # sift disparity range
-    if matches is not None:
-        sift_disp = disparity_range_from_matches(matches, H1, H2, w, h)
-        print("SIFT disparity range: [%f, %f]" % (sift_disp[0], sift_disp[1]))
-        if cfg['disp_range_method'] == 'sift':
-            return sift_disp
+    elif cfg['disp_range_method'] == 'sift':
+        if sift_disp is not None:
+            disp = sift_disp
 
-    # expand disparity range with srtm according to cfg params
-    if cfg['disp_range_method'] == 'wider_sift_srtm' and (matches is not None):
-        disp = min(srtm_disp[0], sift_disp[0]), max(srtm_disp[1], sift_disp[1])
-        print("Final disparity range: [%f, %f]" % (disp[0], disp[1]))
-        return disp
+    elif cfg['disp_range_method'] == 'wider_sift_srtm':
+        if sift_disp is not None:
+            disp = min(srtm_disp[0], sift_disp[0]), max(srtm_disp[1], sift_disp[1])
+        else:
+            disp = srtm_disp
+        
+    elif cfg['disp_range_method'] == 'fixed_pixel_range':
+        if cfg['disp_min'] is not None and cfg['disp_max'] is not None:
+            disp = cfg['disp_min'], cfg['disp_max']
+
+    elif cfg['disp_range_method'] == 'fixed_altitude_range':
+        disp = alt_disp
+
+    # impose a minimal disparity range (TODO this is valid only with the
+    # 'center' flag for register_horizontally_translation)
+    disp = min(-3, disp[0]), max( 3,  disp[1])
+        
+    print("Final disparity range: [%f, %f]" % (disp[0], disp[1]))
+    return disp
 
 
 def rectification_homographies(matches, x, y, w, h, hmargin=0, vmargin=0):
@@ -316,13 +345,6 @@ def rectify_pair(im1, im2, rpc1, rpc2, x, y, w, h, out1, out2, A=None,
         {h,v}margin (optional): horizontal and vertical margins added on the
             sides of the rectified images
 
-        This function uses the parameter subsampling_factor from the
-        config module. If the factor z > 1 then the output images will
-        be subsampled by a factor z. The output matrices H1, H2, and the
-        ranges are also updated accordingly:
-        Hi = Z * Hi with Z = diag(1/z, 1/z, 1) and
-        disp_min = disp_min / z  (resp _max)
-
     Returns:
         H1, H2: Two 3x3 matrices representing the rectifying homographies that
         have been applied to the two original (large) images.
@@ -376,22 +398,15 @@ def rectify_pair(im1, im2, rpc1, rpc2, x, y, w, h, out1, out2, A=None,
                                    os.path.join(out_dir, 'sift_matches_disp.png'))
     disp_m, disp_M = disparity_range(rpc1, rpc2, x, y, w, h, H1, H2,
                                      sift_matches, A)
-
-    # impose a minimal disparity range (TODO this is valid only with the
-    # 'center' flag for register_horizontally_translation)
-    disp_m = min(-3, disp_m)
-    disp_M = max(3, disp_M)
-
-    #  if subsampling_factor'] the homographies are altered to reflect the zoom
-    z = cfg['subsampling_factor']
-    if z != 1:
-        Z = np.diag((1/z, 1/z, 1))
-        H1 = np.dot(Z, H1)
-        H2 = np.dot(Z, H2)
-        disp_m = np.floor(disp_m / z)
-        disp_M = np.ceil(disp_M / z)
-        hmargin = int(np.floor(hmargin / z))
-        vmargin = int(np.floor(vmargin / z))
+    
+    # compute rectifying homographies for non-epipolar mode (rectify the secondary tile only)
+    if block_matching.rectify_secondary_tile_only(cfg['matching_algorithm']):
+        H1_inv = np.linalg.inv(H1)
+        H1 = np.eye(3) # H1 is replaced by 2-D array with ones on the diagonal and zeros elsewhere
+        H2 = np.dot(H1_inv,H2)
+        T = common.matrix_translation(-x + hmargin, -y + vmargin)
+        H1 = np.dot(T, H1)
+        H2 = np.dot(T, H2)
 
     # compute output images size
     roi = [[x, y], [x+w, y], [x+w, y+h], [x, y+h]]
@@ -403,5 +418,12 @@ def rectify_pair(im1, im2, rpc1, rpc2, x, y, w, h, out1, out2, A=None,
     # apply homographies and do the crops
     common.image_apply_homography(out1, im1, H1, w0 + 2*hmargin, h0 + 2*vmargin)
     common.image_apply_homography(out2, im2, H2, w0 + 2*hmargin, h0 + 2*vmargin)
+
+    if block_matching.rectify_secondary_tile_only(cfg['matching_algorithm']):
+        pts_in = [[0, 0], [disp_m, 0], [disp_M, 0]]
+        pts_out = common.points_apply_homography(H1_inv,
+                                                 pts_in)
+        disp_m = pts_out[1,:] - pts_out[0,:]
+        disp_M = pts_out[2,:] - pts_out[0,:]
 
     return H1, H2, disp_m, disp_M

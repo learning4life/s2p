@@ -20,6 +20,15 @@ from s2plib import masking
 from s2plib import parallel
 from s2plib.config import cfg
 
+# This function is here as a workaround to python bug #24313 When
+# using python3, json does not know how to serialize numpy.int64 on
+# some platform numpy also decides to go for int64 when numpy.arange
+# is called. This results in our json not being serializable anymore
+# Calling json.dump(..,default=workaround_json_int64) fixes this
+# https://bugs.python.org/issue24313
+def workaround_json_int64(o):
+    if isinstance(o,np.integer) : return int(o)
+    raise TypeError
 
 def dict_has_keys(d, l):
     """
@@ -67,6 +76,12 @@ def check_parameters(d):
         print('ERROR: missing or incomplete roi definition')
         sys.exit(1)
 
+    # d['roi'] : all the values must be integers
+    d['roi']['x'] = int(np.floor(d['roi']['x']))
+    d['roi']['y'] = int(np.floor(d['roi']['y']))
+    d['roi']['w'] = int(np.ceil(d['roi']['w']))
+    d['roi']['h'] = int(np.ceil(d['roi']['h']))
+
     # warn about unknown parameters. The known parameters are those defined in
     # the global config.cfg dictionary, plus the mandatory 'images' and 'roi' or
     # 'roi_utm'
@@ -76,7 +91,7 @@ def check_parameters(d):
                 print('WARNING: ignoring unknown parameter {}.'.format(k))
 
 
-def build_cfg(config_file):
+def build_cfg(user_cfg):
     """
     Populate a dictionary containing the s2p parameters from a user config file.
 
@@ -84,13 +99,8 @@ def build_cfg(config_file):
     module.
 
     Args:
-        config_file: path to a json configuration file
+        user_cfg: user config dictionary
     """
-    # read the json configuration file
-    f = open(config_file)
-    user_cfg = json.load(f)
-    f.close()
-
     # check that all the mandatory arguments are defined
     check_parameters(user_cfg)
 
@@ -107,17 +117,17 @@ def build_cfg(config_file):
     cfg['images'][0].setdefault('roi')
     cfg['images'][0].setdefault('wat')
 
-    # check the zoom factor
-    z = cfg['subsampling_factor']
-    assert(z > 0 and z == np.floor(z))
+    # Make sure that input data have absolute paths
+    for i in range(0,len(cfg['images'])):
+        for d in ['clr','cld','roi','wat','img','rpc']:
+            if d in cfg['images'][i] and cfg['images'][i][d] is not None:
+                cfg['images'][i][d] = os.path.abspath(cfg['images'][i][d])
 
-    # ensure that the coordinates of the ROI are multiples of the zoom factor,
-    # to avoid bad registration of tiles due to rounding problems.
     x = cfg['roi']['x']
     y = cfg['roi']['y']
     w = cfg['roi']['w']
     h = cfg['roi']['h']
-    x, y, w, h = common.round_roi_to_nearest_multiple(z, x,y, w, h)
+    
     cfg['roi'] = {'x': x, 'y': y, 'w': w, 'h': h}
 
     # if srtm is disabled set disparity range method to sift
@@ -125,7 +135,8 @@ def build_cfg(config_file):
         cfg['disp_range_method'] = 'sift'
 
     # get utm zone
-    cfg['utm_zone'] = rpc_utils.utm_zone(cfg['images'][0]['rpc'], x, y, w, h)
+    if 'utm_zone' not in cfg or cfg['utm_zone'] is None:
+        cfg['utm_zone'] = rpc_utils.utm_zone(cfg['images'][0]['rpc'], x, y, w, h)
 
 
 def make_dirs():
@@ -133,12 +144,13 @@ def make_dirs():
     Create directories needed to run s2p.
     """
     common.mkdir_p(cfg['out_dir'])
-    common.mkdir_p(cfg['temporary_dir'])
-    common.mkdir_p(os.path.join(cfg['temporary_dir'], 'meta'))
+    common.mkdir_p(os.path.expandvars(cfg['temporary_dir']))
 
     # store a json dump of the config.cfg dictionary
     with open(os.path.join(cfg['out_dir'], 'config.json'), 'w') as f:
-        json.dump(cfg, f, indent=2)
+        cfg_copy = copy.deepcopy(cfg)
+        cfg_copy['out_dir']='.'
+        json.dump(cfg_copy, f, indent=2, default=workaround_json_int64)
 
     # copy RPC xml files in the output directory
     for img in cfg['images']:
@@ -158,13 +170,13 @@ def adjust_tile_size():
     """
     Adjust the size of the tiles.
     """
-    zoom = cfg['subsampling_factor']
-    tile_w = min(cfg['roi']['w'], zoom * cfg['tile_size'])  # tile width
+
+    tile_w = min(cfg['roi']['w'], cfg['tile_size'])  # tile width
     ntx = int(np.round(float(cfg['roi']['w']) / tile_w))
     # ceil so that, if needed, the last tile is slightly smaller
     tile_w = int(np.ceil(float(cfg['roi']['w']) / ntx))
 
-    tile_h = min(cfg['roi']['h'], zoom * cfg['tile_size'])  # tile height
+    tile_h = min(cfg['roi']['h'], cfg['tile_size'])  # tile height
     nty = int(np.round(float(cfg['roi']['h']) / tile_h))
     tile_h = int(np.ceil(float(cfg['roi']['h']) / nty))
 
@@ -178,23 +190,66 @@ def adjust_tile_size():
     return tile_w, tile_h
 
 
-def compute_tiles_coordinates(rx, ry, rw, rh, tw, th, z=1):
+def compute_tiles_coordinates(rx, ry, rw, rh, tw, th):
     """
     """
     out = []
+    neighborhood_dict = dict()
+
     for y in np.arange(ry, ry + rh, th):
         h = min(th, ry + rh - y)
         for x in np.arange(rx, rx + rw, tw):
             w = min(tw, rx + rw - x)
 
-            # ensure that tile coordinates are multiples of the zoom factor
-            x, y, w, h = common.round_roi_to_nearest_multiple(z, x, y, w, h)
-
             out.append((x, y, w, h))
-    return out
+
+            # get coordinates of tiles from neighborhood
+            out2 = []
+            for y2 in [y - th, y, y + th]:
+                h2 = min(th, ry + rh - y2)
+                for x2 in [x - tw, x, x + tw]:
+                    w2 = min(tw, rx + rw - x2)
+                    if rx + rw > x2 >= rx:
+                        if ry + rh > y2 >= ry:
+                            out2.append((x2, y2, w2, h2))
+
+            neighborhood_dict[str((x, y, w, h))] = out2
+
+    return out, neighborhood_dict
 
 
-def tiles_full_info(tw, th):
+def get_tile_dir(x, y, w, h):
+    """
+    Get the name of a tile directory
+    """
+    return os.path.join('tiles','row_{:07d}_height_{}'.format(y, h),
+                        'col_{:07d}_width_{}'.format(x, w))
+
+
+def create_tile(coords, neighborhood_coords_dict):
+    tile = {}
+    x, y, w, h = coords
+    tile['dir'] = os.path.join(cfg['out_dir'], get_tile_dir(x, y, w, h))
+    tile['coordinates'] = coords
+    tile['neighborhood_dirs'] = list()
+    key = str((x, y, w, h))
+
+    if 'neighborhood_dirs' in cfg:
+        tile['neighborhood_dirs'] = cfg['neighborhood_dirs']
+    elif key in neighborhood_coords_dict:
+        for coords2 in neighborhood_coords_dict[key]:
+            x2, y2, w2, h2 = coords2
+            tile['neighborhood_dirs'].append(os.path.join('../../..', get_tile_dir(x2,
+                                                                                   y2,
+                                                                                   w2,
+                                                                                   h2)))
+
+    tile_json = os.path.join(get_tile_dir(x,y,w,h),'config.json')
+    tile['json'] = tile_json
+
+    return tile
+
+def tiles_full_info(tw, th, tiles_txt, create_masks=False):
     """
     List the tiles to process and prepare their output directories structures.
 
@@ -209,58 +264,64 @@ def tiles_full_info(tw, th):
     roi_msk = cfg['images'][0]['roi']
     cld_msk = cfg['images'][0]['cld']
     wat_msk = cfg['images'][0]['wat']
-    z =  cfg['subsampling_factor']
     rx = cfg['roi']['x']
     ry = cfg['roi']['y']
     rw = cfg['roi']['w']
     rh = cfg['roi']['h']
 
-    # list tiles coordinates
-    tiles_coords = compute_tiles_coordinates(rx, ry, rw, rh, tw, th, z)
-
-    # compute all masks in parallel as numpy arrays
-    tiles_masks = parallel.launch_calls_simple(masking.cloud_water_image_domain,
-                                               tiles_coords,
-                                               cfg['max_processes'], rpc,
-                                               roi_msk, cld_msk, wat_msk,
-                                               cfg['use_srtm_for_water'])
-
     # build a tile dictionary for all non-masked tiles and store them in a list
     tiles = []
-    for coords, mask in zip(tiles_coords, tiles_masks):
-        if mask.any():  # there's at least one non-masked pixel in the tile
-            tile = {}
-            x, y, w, h = coords
-            tile['dir'] = os.path.join(cfg['out_dir'],
-                                       'tiles_row_{}_height_{}'.format(y, h),
-                                       'col_{}_width_{}'.format(x, w))
-            tile['coordinates'] = coords
-            tile['mask'] = mask
-            tiles.append(tile)
+    # list tiles coordinates
+    tiles_coords, neighborhood_coords_dict = compute_tiles_coordinates(rx, ry, rw, rh, tw, th)
 
-    # make tiles directories and store json configuration dumps
-    for tile in tiles:
-        common.mkdir_p(tile['dir'])
-        for i in range(1, len(cfg['images'])):
-            common.mkdir_p(os.path.join(tile['dir'], 'pair_{}'.format(i)))
+    if os.path.exists(tiles_txt) is False or create_masks is True:
+        print('\ndiscarding masked tiles...')
+        # compute all masks in parallel as numpy arrays
+        tiles_masks = parallel.launch_calls_simple(masking.cloud_water_image_domain,
+                                                   tiles_coords,
+                                                   cfg['max_processes'], rpc,
+                                                   roi_msk, cld_msk, wat_msk,
+                                                   cfg['use_srtm_for_water'])
+        for coords, mask in zip(tiles_coords,
+                                tiles_masks):
+            if mask.any():  # there's at least one non-masked pixel in the tile
+                tile = create_tile(coords, neighborhood_coords_dict)
+                tiles.append(tile)
 
-        # save a json dump of the tile configuration
-        tile_cfg = copy.deepcopy(cfg)
-        x, y, w, h = tile['coordinates']
-        tile_cfg['roi'] = {'x': x, 'y': y, 'w': w, 'h': h}
-        tile_cfg['full_img'] = False
-        tile_cfg['max_processes'] = 1
-        tile_cfg['omp_num_threads'] = 1
+                # make tiles directories and store json configuration dumps
+                common.mkdir_p(tile['dir'])
+                for i in range(1, len(cfg['images'])):
+                    common.mkdir_p(os.path.join(tile['dir'], 'pair_{}'.format(i)))
 
-        tile_json = os.path.join(tile['dir'], 'config.json')
-        tile['json'] = tile_json
+                # save a json dump of the tile configuration
+                tile_cfg = copy.deepcopy(cfg)
+                x, y, w, h = tile['coordinates']
+                tile_cfg['roi'] = {'x': x, 'y': y, 'w': w, 'h': h}
+                tile_cfg['full_img'] = False
+                tile_cfg['max_processes'] = 1
+                tile_cfg['omp_num_threads'] = 1
+                tile_cfg['neighborhood_dirs'] = tile['neighborhood_dirs']
+                tile_cfg['out_dir'] = '../../..'
 
-        with open(tile_json, 'w') as f:
-            json.dump(tile_cfg, f, indent=2)
+                with open(os.path.join(cfg['out_dir'], tile['json']), 'w') as f:
+                    json.dump(tile_cfg, f, indent=2,default=workaround_json_int64)
 
-        # save the mask
-        piio.write(os.path.join(tile['dir'],
-                                'cloud_water_image_domain_mask.png'),
-                   tile['mask'].astype(np.uint8))
+                # save the mask
+                piio.write(os.path.join(tile['dir'],
+                                        'cloud_water_image_domain_mask.png'),
+                           mask.astype(np.uint8))
+    else:
+        if len(tiles_coords) == 1:
+            tiles.append(create_tile(tiles_coords[0], neighborhood_coords_dict))
+        else:
+            with open(tiles_txt, 'r') as f_tiles:
+                for config_json in f_tiles:
+                    tile = {}
+                    with open(os.path.join(cfg['out_dir'],
+                                           config_json.rstrip(os.linesep)), 'r') as f_config:
+                        tile_cfg = json.load(f_config)
+                        roi = tile_cfg['roi']
+                        coords = roi['x'], roi['y'], roi['w'], roi['h']
+                        tiles.append(create_tile(coords, neighborhood_coords_dict))
 
     return tiles

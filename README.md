@@ -35,7 +35,7 @@ A precompiled docker image is available and ready to use:
 Run the python script `s2p.py` with a json configuration file as unique
 argument:
 
-    python s2p.py test.json
+    python s2p.py testdata/input_pair/config.json
 
 All the parameters of the algorithm, paths to input and output data are stored
 in the json file. See the provided `test.json` file for an example, and the
@@ -59,23 +59,26 @@ ROI will be selected interactively on that preview. The path of the preview
 file must be given by the key `'prv'` of the `'images'[0]` dictionary (as in
 the example).
 
+#### File paths in json configuration files
+
+In json configuration files, relative file path for inputs files and output directory are relative to the json file location, not to the current working directory.
 
 ## Dependencies
 
 Required dependencies (Ubuntu 16.04):
 
-    apt-get install build-essential gdal-bin geographiclib-tools libgeographic-dev libfftw3-dev libgdal-dev libgeotiff-dev libtiff5-dev python python-gdal python-numpy python-pip
+    apt-get install build-essential cmake gdal-bin geographiclib-tools libgeographic-dev libfftw3-dev libgdal-dev libgeotiff-dev libtiff5-dev python python-gdal python-numpy python-pip
 
 and
 
-    pip install utm bs4 requests
+    pip install utm bs4 lxml requests
 
 `gdal` version must be 2.1.0 or newer.
 
 
 ## Installation
 
-    git clone https://github.com/carlodef/s2p.git --recursive
+    git clone https://github.com/MISS3D/s2p.git --recursive
     cd s2p
     make all
 
